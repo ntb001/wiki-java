@@ -23,17 +23,28 @@ package org.wikipedia;
 import java.io.*;
 import java.net.*;
 import java.nio.*;
+import java.nio.charset.*;
 import java.nio.file.*;
-import java.text.Normalizer;
+import java.text.*;
 import java.time.*;
 import java.time.format.*;
 import java.util.*;
 import java.util.function.*;
 import java.util.logging.*;
 import java.util.stream.*;
-import java.util.zip.GZIPInputStream;
 
 import javax.security.auth.login.*;
+
+import org.apache.http.*;
+import org.apache.http.client.config.*;
+import org.apache.http.client.entity.*;
+import org.apache.http.client.methods.*;
+import org.apache.http.client.protocol.*;
+import org.apache.http.client.utils.*;
+import org.apache.http.entity.*;
+import org.apache.http.impl.client.*;
+import org.apache.http.message.*;
+import org.apache.http.util.*;
 
 /**
  *  This is a somewhat sketchy bot framework for editing MediaWiki wikis.
@@ -449,6 +460,12 @@ public class Wiki implements Comparable<Wiki>
     protected String apiUrl;
 
     /**
+     * Parameters for the apiUrl.
+     * @see #apiUrl
+     */
+    protected List<NameValuePair> apiParams;
+
+    /**
      *  Base URL for action=query type requests from the API.  (Needs to be
      *  accessible to subclasses.)
      *  @see #initVars()
@@ -459,13 +476,19 @@ public class Wiki implements Comparable<Wiki>
      */
     protected String query;
 
+    /**
+     * Parameters for the query URL.
+     * @see #query
+     */
+    protected List<NameValuePair> queryParams;
+
     // wiki properties
     private boolean wgCapitalLinks = true;
     private ZoneId timezone = ZoneId.of("UTC");
     private Locale locale;
 
     // user management
-    private final CookieManager cookies = new CookieManager(null, CookiePolicy.ACCEPT_ALL);
+    private final HttpClientContext clientContext = new HttpClientContext();
     private User user;
     private int statuscounter = 0;
 
@@ -577,7 +600,6 @@ public class Wiki implements Comparable<Wiki>
         // TODO: remove this
         logger.setLevel(loglevel);
         logger.log(Level.CONFIG, "[{0}] Using Wiki.java {1}", new Object[] { domain, version });
-        CookieHandler.setDefault(cookies);
         initVars();
     }
 
@@ -635,14 +657,16 @@ public class Wiki implements Comparable<Wiki>
         StringBuilder basegen = new StringBuilder(protocol);
         basegen.append(domain);
         basegen.append(scriptPath);
-        StringBuilder apigen = new StringBuilder(basegen);
-        apigen.append("/api.php?format=xml");
+        apiUrl = basegen.toString() + "/api.php";
+        apiParams = new ArrayList<>();
+        query = basegen.toString() + "/api.php";
+        queryParams = new ArrayList<>();
+        queryParams.add(new BasicNameValuePair("format", "xml"));
         // MediaWiki has inbuilt maxlag functionality, see [[mw:Manual:Maxlag
         // parameter]]. Let's exploit it.
         if (maxlag >= 0)
         {
-            apigen.append("&maxlag=");
-            apigen.append(maxlag);
+            queryParams.add(new BasicNameValuePair("maxlag", ""+maxlag));
             basegen.append("/index.php?maxlag=");
             basegen.append(maxlag);
             basegen.append("&title=");
@@ -652,14 +676,13 @@ public class Wiki implements Comparable<Wiki>
         base = basegen.toString();
         // use inbuilt assertions
         if ((assertion & ASSERT_BOT) == ASSERT_BOT)
-            apigen.append("&assert=bot");
+            queryParams.add(new BasicNameValuePair("assert", "bot"));
         else if ((assertion & ASSERT_USER) == ASSERT_USER)
-            apigen.append("&assert=user");
-        apiUrl = apigen.toString();
-        apigen.append("&action=query");
+            queryParams.add(new BasicNameValuePair("assert", "user"));
+        apiParams.addAll(queryParams);
+        queryParams.add(new BasicNameValuePair("action", "query"));
         if (resolveredirect)
-            apigen.append("&redirects");
-        query = apigen.toString();
+            queryParams.add(new BasicNameValuePair("redirects", "true"));
     }
 
     /**
@@ -1026,7 +1049,7 @@ public class Wiki implements Comparable<Wiki>
         buffer.append(",statusCheckInterval=");
         buffer.append(statusinterval);
         buffer.append(",cookies=");
-        buffer.append(cookies);
+        buffer.append(clientContext.getCookieStore());
         buffer.append("]");
         return buffer.toString();
     }
@@ -1202,7 +1225,7 @@ public class Wiki implements Comparable<Wiki>
      */
     public synchronized void logout()
     {
-        cookies.getCookieStore().removeAll();
+        clientContext.getCookieStore().clear();
         user = null;
         max = 500;
         slowmax = 50;
@@ -2808,7 +2831,7 @@ public class Wiki implements Comparable<Wiki>
     {
         Map<String, String> getparams = new HashMap<>();
         if (!resolveredirect)
-            getparams.put("redirects", "");
+            getparams.put("redirects", "true");
         Map<String, Object> postparams = new HashMap<>();
         String[] ret = Arrays.copyOf(titles, titles.length);
         for (String blah : constructTitleString(titles))
@@ -3961,16 +3984,18 @@ public class Wiki implements Comparable<Wiki>
 
         // then we read the image
         logurl(url2, "getImage");
-        URLConnection connection = makeConnection(url2);
-        connection.connect();
-
-        // download image to the file
-        InputStream input = connection.getInputStream();
-        if ("gzip".equals(connection.getContentEncoding()))
-            input = new GZIPInputStream(input);
-        Files.copy(input, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
-        log(Level.INFO, "getImage", "Successfully retrieved image \"" + title + "\"");
-        return true;
+        try (CloseableHttpClient client = makeConnection())
+        {
+            HttpGet request = new HttpGet(url2);
+            try (CloseableHttpResponse response = client.execute(request, clientContext))
+            {
+                // download image to the file
+                InputStream input = response.getEntity().getContent();
+		        Files.copy(input, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+		        log(Level.INFO, "getImage", "Successfully retrieved image \"" + title + "\"");
+		        return true;
+            }
+        }
     }
 
     /**
@@ -4131,23 +4156,25 @@ public class Wiki implements Comparable<Wiki>
             OffsetDateTime timestamp = OffsetDateTime.parse(parseAttribute(line, "timestamp", a));
             if (timestamp.equals(entry.getTimestamp()))
             {
-                // this is it
+            	// this is it
                 String url = parseAttribute(line, "url", a);
                 logurl(url, "getOldImage");
-                URLConnection connection = makeConnection(url);
-                connection.connect();
-
-                // download image to file
-                InputStream input = connection.getInputStream();
-                if ("gzip".equals(connection.getContentEncoding()))
-                    input = new GZIPInputStream(input);
-                Files.copy(input, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                // scrape archive name for logging purposes
-                String archive = parseAttribute(line, "archivename", 0);
-                if (archive == null)
-                    archive = entry.getTarget();
-                log(Level.INFO, "getOldImage", "Successfully retrieved old image \"" + archive + "\"");
-                return true;
+                try (CloseableHttpClient client = makeConnection())
+                {
+                    HttpGet request = new HttpGet(url);
+                    try (CloseableHttpResponse response = client.execute(request, clientContext))
+                    {
+                        // download image to the file
+                        InputStream input = response.getEntity().getContent();
+        		        Files.copy(input, file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        		        // scrape archive name for logging purposes
+                        String archive = parseAttribute(line, "archivename", 0);
+                        if (archive == null)
+                            archive = entry.getTarget();
+        		        log(Level.INFO, "getOldImage", "Successfully retrieved old image \"" + archive + "\"");
+        		        return true;
+                    }
+                }
             }
         }
         return false;
@@ -4703,7 +4730,7 @@ public class Wiki implements Comparable<Wiki>
             Map<String, Object> ret = metamap.get(normalize(usernames[i]));
             if (ret != null)
             {
-                info[i] = new HashMap(ret);
+                info[i] = new HashMap<String, Object>(ret);
                 info[i].put("inputname", usernames[i]);
             }
         }
@@ -7813,13 +7840,16 @@ public class Wiki implements Comparable<Wiki>
         Map<String, Object> postparams, String caller, BiConsumer<String, List<T>> parser) throws IOException
     {
         List<T> results = new ArrayList<>(1333);
-        StringBuilder xxcontinue = new StringBuilder();
+        Map<String, String> xxcontinue = new HashMap<>();
         String limitstring = queryPrefix + "limit";
         do
         {
-            getparams.put(limitstring, String.valueOf(Math.min(querylimit - results.size(), max)));
-            String line = makeHTTPRequest(urlbase + xxcontinue.toString(), getparams, postparams, caller);
-            xxcontinue.setLength(0);
+        	Map<String, String> params = new HashMap<>();
+        	params.putAll(getparams);
+            params.put(limitstring, String.valueOf(Math.min(querylimit - results.size(), max)));
+            params.putAll(xxcontinue);
+            String line = makeHTTPRequest(urlbase, params, postparams, caller);
+            xxcontinue.clear();
 
             // Continuation parameter has form:
             // <continue rccontinue="20170924064528|986351741" continue="-||" />
@@ -7828,16 +7858,13 @@ public class Wiki implements Comparable<Wiki>
                 int a = line.indexOf("<continue ") + 10;
                 int b = line.indexOf("/>", a);
                 String[] temp = line.substring(a, b).split("\"");
-                xxcontinue.append("&");
-                xxcontinue.append(temp[0]);
-                xxcontinue.append(URLEncoder.encode(temp[1], "UTF-8"));
-                xxcontinue.append(temp[2].replace(" ", "&"));
-                xxcontinue.append(URLEncoder.encode(temp[3], "UTF-8"));
+                xxcontinue.put(temp[0].replace("=", ""), temp[1]);
+                xxcontinue.put(temp[2].replace("=", "").trim(), temp[3]);
             }
 
             parser.accept(line, results);
         }
-        while (xxcontinue.length() != 0 && results.size() < querylimit);
+        while (!xxcontinue.isEmpty() && results.size() < querylimit);
         return results;
     }
 
@@ -7884,42 +7911,46 @@ public class Wiki implements Comparable<Wiki>
      *  @since 0.18
      */
     protected String makeHTTPRequest(String urlbase, Map<String, String> getparams, Map<String, Object> postparams, String caller) throws IOException
-    {
+    {   	
         // build the URL
-        StringBuilder urlbuilder = new StringBuilder(urlbase);
-        for (Map.Entry<String, String> entry : getparams.entrySet())
+        URI uri;
+        try
         {
-            urlbuilder.append('&');
-            urlbuilder.append(entry.getKey());
-            urlbuilder.append('=');
-            urlbuilder.append(URLEncoder.encode(entry.getValue(), "UTF-8"));
-        }
-        String url = urlbuilder.toString();
-
-        // POST stuff
+            List<NameValuePair> urlParams = new ArrayList<>();
+            urlParams.addAll(getparams.entrySet().stream()
+                    .map(e -> new BasicNameValuePair(e.getKey(), e.getValue()))
+    	            .collect(Collectors.toList()));
+            if (urlbase == apiUrl)
+            {
+                urlParams.addAll(apiParams);
+            }
+            else if (urlbase == query)
+            {
+                urlParams.addAll(queryParams);
+            }
+            URIBuilder uriBuilder = new URIBuilder(urlbase);
+            uriBuilder.setParameters(urlParams);
+            uri = uriBuilder.build();
+    	}
+    	catch (URISyntaxException ex)
+    	{
+    		throw new MalformedURLException("Could not build the URL from the getparams.");
+    	}
+        
+        HttpUriRequest request;
         boolean isPOST = (postparams != null && !postparams.isEmpty());
-        StringBuilder stringPostBody = new StringBuilder();
-        boolean multipart = false;
-        byte[] multipartPostBody = null;
-        String boundary = "----------NEXT PART----------";
         if (isPOST)
         {
-            // determine whether this is a multipart post and convert any values
-            // to String if necessary
-            for (Map.Entry<String, Object> entry : postparams.entrySet())
-            {
-                Object value = entry.getValue();
-                if (value instanceof byte[])
-                    multipart = true;
-                else
-                    entry.setValue(convertToString(value));
-            }
-
+            HttpPost post = new HttpPost(uri);
+            boolean multipart = postparams.entrySet().stream()
+                    .anyMatch(e -> e.getValue() instanceof byte[]);
+            
             // now we know how we're sending it, construct the post body
             if (multipart)
             {
-                String nextpart = "--" + boundary + "\r\n";
-                ByteArrayOutputStream bout = new ByteArrayOutputStream();
+           	    String boundary = "----------NEXT PART----------";
+           	    String nextpart = "--" + boundary + "\r\n";
+           	    ByteArrayOutputStream bout = new ByteArrayOutputStream();
                 try (DataOutputStream out = new DataOutputStream(bout))
                 {
                     out.writeBytes(nextpart);
@@ -7933,7 +7964,7 @@ public class Wiki implements Comparable<Wiki>
                         if (value instanceof String)
                         {
                             out.writeBytes("Content-Type: text/plain; charset=UTF-8\r\n\r\n");
-                            out.write(((String)value).getBytes("UTF-8"));
+                            out.write(convertToString(entry.getValue()).getBytes(StandardCharsets.UTF_8));
                         }
                         else if (value instanceof byte[])
                         {
@@ -7945,71 +7976,45 @@ public class Wiki implements Comparable<Wiki>
                     }
                     out.writeBytes("--\r\n");
                 }
-                multipartPostBody = bout.toByteArray();
+                post.setHeader(HttpHeaders.CONTENT_TYPE, "multipart/form-data; boundary=" + boundary);
+                post.setEntity(new ByteArrayEntity(bout.toByteArray()));
             }
             else
             {
-                // automatically encode Strings sent via normal POST
-                for (Map.Entry<String, Object> entry : postparams.entrySet())
-                {
-                    stringPostBody.append('&');
-                    stringPostBody.append(entry.getKey());
-                    stringPostBody.append('=');
-                    stringPostBody.append(URLEncoder.encode(entry.getValue().toString(), "UTF-8"));
-                }
+                List<NameValuePair> nvps = postparams.entrySet().stream()
+                        .map(e -> new BasicNameValuePair(e.getKey(), convertToString(e.getValue())))
+                        .collect(Collectors.toList());
+                post.setEntity(new UrlEncodedFormEntity(nvps, StandardCharsets.UTF_8));
             }
+            request = post;
         }
-
+        else
+        {
+            HttpGet get = new HttpGet(uri);
+            request = get;
+        }
+       
         // main fetch/retry loop
         String response = null;
         int tries = maxtries;
         do
         {
-            logurl(url, caller);
+            logurl(uri.toString(), caller);
             tries--;
-            try
+            try (CloseableHttpClient client = makeConnection())
             {
-                // actually make the request
-                URLConnection connection = makeConnection(url);
-                if (isPOST)
+                try (CloseableHttpResponse httpResponse = client.execute(request, clientContext))
                 {
-                    connection.setDoOutput(true);
-                    if (multipart)
-                        connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
-                }
-                connection.connect();
-                if (isPOST)
-                {
-                    // send the post body
-                    if (multipart)
+                    // Check database lag and retry if necessary. These retries
+                    // don't count.
+                    if (checkLag(httpResponse))
                     {
-                        try (OutputStream uout = connection.getOutputStream())
-                        {
-                            uout.write(multipartPostBody);
-                        }
+                        tries++;
+                        throw new HttpRetryException("Database lagged.", 503);
                     }
-                    else
-                    {
-                        try (OutputStreamWriter out = new OutputStreamWriter(connection.getOutputStream(), "UTF-8"))
-                        {
-                            out.write(stringPostBody.toString());
-                        }
-                    }
-                }
 
-                // Check database lag and retry if necessary. These retries
-                // don't count.
-                if (checkLag(connection))
-                {
-                    tries++;
-                    throw new HttpRetryException("Database lagged.", 503);
-                }
-
-                // get the response from the server
-                try (BufferedReader in = new BufferedReader(new InputStreamReader(
-                    zipped ? new GZIPInputStream(connection.getInputStream()) : connection.getInputStream(), "UTF-8")))
-                {
-                    response = in.lines().collect(Collectors.joining("\n"));
+                    // get the response from the server
+                    response = EntityUtils.toString(httpResponse.getEntity());
                 }
 
                 // Check for rate limit (though might be a long one e.g. email)
@@ -8092,7 +8097,7 @@ public class Wiki implements Comparable<Wiki>
         }
         else if (param instanceof Collection)
         {
-            Collection<?> coll = (Collection)param;
+            Collection<?> coll = (Collection<?>)param;
             return coll.stream()
                 .map(item -> convertToString(item))
                 .collect(Collectors.joining("|"));
@@ -8110,16 +8115,16 @@ public class Wiki implements Comparable<Wiki>
      *  MediaWiki documentation</a>
      *  @since 0.32
      */
-    protected synchronized boolean checkLag(URLConnection connection)
+    protected synchronized boolean checkLag(HttpResponse response)
     {
-        int lag = connection.getHeaderFieldInt("X-Database-Lag", -5);
+        int lag = getHeaderFieldInt(response, "X-Database-Lag", -5);
         // X-Database-Lag is the current lag rounded down to the nearest integer.
         // Thus, we need to retry in case of equality.
         if (lag >= maxlag)
         {
             try
             {
-                int time = connection.getHeaderFieldInt("Retry-After", 10);
+                int time = getHeaderFieldInt(response, "Retry-After", 10);
                 logger.log(Level.WARNING, "Current database lag {0} s exceeds maxlag of {1} s, waiting {2} s.", new Object[] { lag, maxlag, time });
                 Thread.sleep(time * 1000L);
             }
@@ -8132,6 +8137,32 @@ public class Wiki implements Comparable<Wiki>
     }
 
     /**
+     * Check headers for an integer value. Return default value if none found.
+     * @param header
+     * @param defaultValue
+     * @return
+     */
+    protected int getHeaderFieldInt(HttpResponse response, String headerName, int defaultValue)
+    {
+        if (response.containsHeader(headerName))
+        {
+        	Header header = response.getFirstHeader(headerName);
+            String value = header.getValue();
+            if (value != null && !value.isEmpty())
+            {
+                try
+                {
+                    return Integer.parseInt(value);
+                }
+                catch (NumberFormatException ignored)
+                {
+                }
+            }
+        }
+        return defaultValue;
+    }
+
+    /**
      *  Creates a new URL connection. Override to change SSL handling, use a
      *  proxy, etc.
      *  @param url a URL string
@@ -8139,15 +8170,16 @@ public class Wiki implements Comparable<Wiki>
      *  @throws IOException if a network error occurs
      *  @since 0.31
      */
-    protected URLConnection makeConnection(String url) throws IOException
+    protected CloseableHttpClient makeConnection() throws IOException
     {
-        URLConnection u = new URL(url).openConnection();
-        u.setConnectTimeout(CONNECTION_CONNECT_TIMEOUT_MSEC);
-        u.setReadTimeout(CONNECTION_READ_TIMEOUT_MSEC);
-        if (zipped)
-            u.setRequestProperty("Accept-encoding", "gzip");
-        u.setRequestProperty("User-Agent", useragent);
-        return u;
+        return HttpClients.custom()
+                .setDefaultRequestConfig(RequestConfig.custom()
+                        .setConnectTimeout(CONNECTION_CONNECT_TIMEOUT_MSEC)
+                        .setSocketTimeout(CONNECTION_READ_TIMEOUT_MSEC)
+                        .setCookieSpec(CookieSpecs.STANDARD)
+                        .build())
+                .setUserAgent(useragent)
+                .build();
     }
 
     /**
